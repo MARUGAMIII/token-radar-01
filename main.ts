@@ -54,6 +54,22 @@ mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
 
+// Read data.js back and check it carries the same board the model scored: a truncated
+// or stale write must refuse here, not at the gate.
+const dataBack = readFileSync(join(out, 'data.js'), 'utf8');
+const dataMatch = /^window\.RADAR=(\{.*\});\n$/.exec(dataBack);
+if (dataMatch === null) {
+  process.stderr.write('token radar: data.js is not the script buildRadar wrote: refusing a stale dashboard\n');
+  process.exit(1);
+}
+const radarBack = JSON.parse(dataMatch[1]!) as { rows?: unknown[]; model_version?: string };
+if (!Array.isArray(radarBack.rows) || radarBack.rows.length !== board.length || radarBack.model_version !== 'radar-3') {
+  process.stderr.write(
+    `token radar: data.js carries ${Array.isArray(radarBack.rows) ? radarBack.rows.length : 'no'} rows for a ${board.length}-row board: refusing a stale dashboard\n`,
+  );
+  process.exit(1);
+}
+
 /** Copy one directory's regular files into `to`, skipping names that start with a dot. */
 function copyFiles(from: string, to: string): string[] {
   if (!existsSync(from)) return [];
@@ -106,5 +122,11 @@ if (!onDisk.equals(Buffer.from(rebuilt))) {
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside), $${radar.total_implied_usd.toLocaleString('en-US')} total implied value\n` +
+    `token radar: comparables: ${board.filter((r) => r.model.comp_level === 'size-matched').length} rows size-matched, ${board.filter((r) => r.model.comp_level === 'category').length} category, ${board.filter((r) => r.model.comp_level === 'market').length} market-anchored; market multiple ${radar.market_multiple.toFixed(3)}x\n` +
+    board
+      .slice(0, 5)
+      .map((r) => `token radar: #${r.rank} ${r.name} — $${r.implied_value_usd.toLocaleString('en-US')} (${r.model.comp_level}, ${r.model.category_multiple.toFixed(3)}x from ${r.model.comps.length} comps)`)
+      .join('\n') +
+    '\n' +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
