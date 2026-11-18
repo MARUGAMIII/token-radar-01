@@ -132,3 +132,34 @@ dialog.detail::backdrop { background: rgba(4, 8, 18, .72); }
   .equation { grid-template-columns: 1fr; }
   .implied { min-width: 120px; }
 }
+
+/* radar-3 additions: top-ten strip, category bars, comp-level badges, comps table. */
+.duo { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; margin: 18px 0; }
+.duo .panel { padding: 16px 18px; }
+.duo h2 { margin: 0 0 2px; font-size: 16px; }
+.duo .sub { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
+.toplist { list-style: none; margin: 0; padding: 0; }
+.toplist li { display: grid; grid-template-columns: 24px 1fr auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+.toplist li:last-child { border-bottom: 0; }
+.toplist li:hover .tname { color: var(--teal); }
+.toplist .trk { color: var(--faint); font-size: 13px; text-align: right; }
+.toplist .tname { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+.toplist .tname small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+.toplist .tval { text-align: right; }
+.toplist .tval b { display: block; font-size: 14px; }
+.toplist .tval span { font-size: 11px; color: var(--muted); }
+.catbar { display: grid; grid-template-columns: 148px 1fr 72px; gap: 10px; align-items: center; padding: 5px 0; font-size: 13px; }
+.catbar .cname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.catbar .cval { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+.track { height: 8px; background: var(--bg); border-radius: 99px; overflow: hidden; }
+.track i { display: block; height: 100%; background: linear-gradient(90deg, var(--teal), var(--amber)); border-radius: 99px; }
+.badge.lvl { color: var(--muted); background: var(--bg); border: 1px solid var(--line); }
+.badge.lvl.matched { color: var(--green); border-color: rgba(61, 220, 151, .4); }
+.comps { width: 100%; border-collapse: collapse; font-size: 13px; }
+.comps th, .comps td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.comps th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+.comps td.num, .comps th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.comps tr:last-child td { border-bottom: 0; }
+@media (max-width: 860px) {
+  .duo { grid-template-columns: 1fr; }
+}
