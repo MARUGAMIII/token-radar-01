@@ -1,4 +1,4 @@
-// Token Radar's value model (radar-2): one sealed snapshot in, one ranked board out.
+// Token Radar's value model (radar-3): one sealed snapshot in, one ranked board out.
 //
 // The board ranks every protocol that records no token and is not a wrapped, staked or
 // bridged product of a protocol whose token already trades. The snapshot's watchlist is
@@ -6,22 +6,42 @@
 // passes the same standalone test is ranked too, so the board is the whole pre-token
 // universe the snapshot can see, not a hand-picked top list.
 //
-// Implied value is one function of the snapshot's own figures, the same for every row:
+// Implied value is one function of the snapshot's own figures, the same for every row.
+// The multiple is the model's heart, and radar-3 prices it the way a buyer would: from
+// the traded protocols that actually resemble the target, not from one flat category
+// number. For each protocol the model blends three anchors, weighted by how many
+// protocols back each one:
 //
-//   category multiple = the market's own price per dollar of TVL in the protocol's
-//                         category: the median market-cap-to-TVL ratio of the protocols
-//                         in that category whose token already trades (five traded
-//                         comps or more), else the whole market's median. The multiples
-//                         are computed from the snapshot at run time, never listed here.
-//   growth multiplier = 1 + clamp(change_7d, -60, 120) / 100 * 0.6
+//   band median      = the median market-cap-to-TVL ratio of the traded protocols in
+//                      the same category whose TVL sits within 0.25x-4x of the target's
+//                      (three or more, else this anchor is empty)
+//   category median  = the median ratio of all traded protocols in the category
+//                      (two or more, else empty)
+//   market median    = the median ratio of every traded protocol in the snapshot,
+//                      always present, weighted as five pseudo-observations
+//
+//   multiple = (5 * market + n_band * band + n_cat * category) / (5 + n_band + n_cat),
+//              clamped to [0.05, 1.0]; each ratio is winsorized to [0.01, 5] first.
+//
+// A category with one traded protocol — Risk Curators has exactly one — cannot price
+// from itself, so its rows fall back to the market anchor and the dashboard says so.
+// A thin category still pulls its rows toward its own level, but never far: two comps
+// at 0.015x move a row from 0.246x to about 0.18x, they do not set it to 0.015x.
+//
+//   growth multiplier   = 1 + 0.3 * sign(g) * sqrt(|g| / 100), g = clamp(change_7d, -50, 150)
+//                         (a weekly move is noisy, so the model takes its square root:
+//                         a 100% week counts about as much as a 30% move counted straight)
 //   maturity multiplier = 0.65 + 0.35 * min(age_days, 1095) / 1095
 //                         (age_days unknown: 365) — the longer a protocol has run with
 //                         no token, the more proven it is and the more overdue a launch.
-//   breadth multiplier = 1 + 0.02 * min(chains - 1, 5) — reach across chains.
-//   implied = max(1, round(tvl_usd * category * growth * maturity * breadth))
+//   breadth multiplier  = 1 + 0.02 * min(chains - 1, 5) — reach across chains.
+//   implied = max(1, round(tvl_usd * multiple * growth * maturity * breadth))
 //
-// No protocol name is ever special-cased. The live-token protocols are kept apart and
-// shown with their market caps, never mixed into the ranking.
+// Every row carries the comparables it was priced from — up to five traded protocols,
+// nearest by TVL, with their own ratios — so a reader can check the multiple instead
+// of taking it on trust. No protocol name is ever special-cased. The live-token
+// protocols are kept apart and shown with their market caps, never mixed into the
+// ranking.
 
 /** One protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -49,9 +69,16 @@ export interface Snapshot {
 /** The model's constants, stated in the dashboard so a reader can check the arithmetic. */
 export interface ModelConstants {
   min_category_comps: number;
+  min_band_comps: number;
+  band_lo: number;
+  band_hi: number;
+  prior_weight: number;
+  ratio_floor: number;
+  ratio_cap: number;
   multiple_floor: number;
   multiple_cap: number;
   growth_weight: number;
+  growth_exponent: number;
   growth_floor: number;
   growth_cap: number;
   maturity_floor: number;
@@ -63,12 +90,19 @@ export interface ModelConstants {
 }
 
 export const MODEL: ModelConstants = {
-  min_category_comps: 5,
+  min_category_comps: 2,
+  min_band_comps: 3,
+  band_lo: 0.25,
+  band_hi: 4,
+  prior_weight: 5,
+  ratio_floor: 0.01,
+  ratio_cap: 5,
   multiple_floor: 0.05,
   multiple_cap: 1.0,
-  growth_weight: 0.6,
-  growth_floor: -60,
-  growth_cap: 120,
+  growth_weight: 0.3,
+  growth_exponent: 0.5,
+  growth_floor: -50,
+  growth_cap: 150,
   maturity_floor: 0.65,
   maturity_range: 0.35,
   maturity_days: 1095,
@@ -78,10 +112,13 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
+
+/** How many comparables a row shows in its detail view. */
+export const COMP_DISPLAY = 5;
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -89,6 +126,16 @@ export interface FarmStep {
   cost: string;
   time: string;
 }
+
+/** One traded protocol a row was priced against: its name, its TVL, its own ratio. */
+export interface CompRef {
+  name: string;
+  tvl_usd: number;
+  ratio: number;
+}
+
+/** How strongly a row's multiple is backed: size-matched comps, category comps, or the market alone. */
+export type CompLevel = 'size-matched' | 'category' | 'market';
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -108,8 +155,12 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     category_multiple: number;
+    band_multiple: number | null;
+    band_comps: number;
     category_comps: number;
     market_multiple: number;
+    comp_level: CompLevel;
+    comps: CompRef[];
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -132,7 +183,11 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   category_multiple: number;
+  band_multiple: number | null;
+  band_comps: number;
   category_comps: number;
+  comp_level: CompLevel;
+  comps: CompRef[];
   growth_multiplier: number;
   maturity_multiplier: number;
   breadth_multiplier: number;
@@ -157,6 +212,7 @@ export interface CategoryMultiple {
   multiple: number;
   comps: number;
   from_market: boolean;
+  rows_band: number;
 }
 
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
@@ -245,26 +301,40 @@ export function isRankable(p: SnapshotProtocol): boolean {
   );
 }
 
+/** The traded protocols the model may price from: a market cap and a TVL, no CEX. */
+export function tradedProtocols(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter(
+    (p) => !isPreToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX',
+  );
+}
+
+/** One traded protocol's own market-cap-to-TVL ratio, winsorized so one wild print cannot set a median. */
+function ratioOf(p: SnapshotProtocol, model: ModelConstants = MODEL): number {
+  return Math.min(model.ratio_cap, Math.max(model.ratio_floor, p.mcap_usd! / p.tvl_usd));
+}
+
+/** Distance in size between two TVLs, in decades: the nearest comps are the closest in size. */
+function sizeDistance(a: number, b: number): number {
+  return Math.abs(Math.log10(Math.max(a, 1)) - Math.log10(Math.max(b, 1)));
+}
+
 /**
- * The market's multiples, computed from the snapshot's own live-token protocols: for
- * every category with at least `minComps` traded protocols, the median market-cap-to-TVL
- * ratio of those protocols; every other category falls back to the whole market's median.
- * The result is a lookup the scorer and the page both use, so the number on the board is
- * the number the model states.
+ * The market's multiples, computed from the snapshot's own live-token protocols: the
+ * whole market's median ratio, and for every category with at least `min_category_comps`
+ * traded protocols, that category's median ratio. The result is a lookup the scorer and
+ * the page both use, so the number on the board is the number the model states.
  */
 export function marketMultiples(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
 ): { market: number; byCategory: Map<string, { multiple: number; comps: number }> } {
-  const live = snapshot.protocols.filter(
-    (p) => !isPreToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX',
-  );
-  const market = live.length > 0 ? median(live.map((p) => p.mcap_usd! / p.tvl_usd)) : 0.25;
+  const live = tradedProtocols(snapshot);
+  const market = live.length > 0 ? median(live.map((p) => ratioOf(p, model))) : 0.25;
   const ratios = new Map<string, number[]>();
   for (const p of live) {
     const key = p.category ?? 'Other';
     const list = ratios.get(key) ?? [];
-    list.push(p.mcap_usd! / p.tvl_usd);
+    list.push(ratioOf(p, model));
     ratios.set(key, list);
   }
   const byCategory = new Map<string, { multiple: number; comps: number }>();
@@ -277,16 +347,72 @@ export function marketMultiples(
   return { market, byCategory };
 }
 
+/** The three anchors behind one protocol's multiple, and the comparables it shows. */
+export interface MultipleBlend {
+  multiple: number;
+  bandMultiple: number | null;
+  bandComps: number;
+  categoryMultiple: number | null;
+  categoryComps: number;
+  marketMultiple: number;
+  level: CompLevel;
+  comps: CompRef[];
+}
+
+/**
+ * One protocol's multiple: a precision-weighted blend of the size-matched band median,
+ * the category median and the market median, each weighted by how many protocols back
+ * it, with the market median carrying a prior weight of five. The comparables the row
+ * shows are the band's protocols nearest by TVL, else the category's nearest, else the
+ * market's nearest — so the number on the board can be checked, not trusted.
+ */
+export function blendMultiple(
+  protocol: SnapshotProtocol,
+  snapshot: Snapshot,
+  multiples: { market: number; byCategory: Map<string, { multiple: number; comps: number }> },
+  model: ModelConstants = MODEL,
+): MultipleBlend {
+  const live = tradedProtocols(snapshot);
+  const category = protocol.category ?? 'Other';
+  const same = live.filter((p) => (p.category ?? 'Other') === category);
+  const band = same.filter(
+    (p) => p.tvl_usd >= model.band_lo * protocol.tvl_usd && p.tvl_usd <= model.band_hi * protocol.tvl_usd,
+  );
+  const bandMultiple = band.length >= model.min_band_comps ? median(band.map((p) => ratioOf(p, model))) : null;
+  const bandComps = bandMultiple !== null ? band.length : 0;
+  const entry = multiples.byCategory.get(category);
+  const categoryMultiple = entry !== undefined ? entry.multiple : null;
+  const categoryComps = entry !== undefined ? entry.comps : 0;
+  let num = model.prior_weight * multiples.market;
+  let den = model.prior_weight;
+  if (bandMultiple !== null) {
+    num += bandComps * bandMultiple;
+    den += bandComps;
+  }
+  if (categoryMultiple !== null) {
+    num += categoryComps * categoryMultiple;
+    den += categoryComps;
+  }
+  const multiple = Math.min(model.multiple_cap, Math.max(model.multiple_floor, num / den));
+  const level: CompLevel = bandComps > 0 ? 'size-matched' : categoryComps > 0 ? 'category' : 'market';
+  const pool = band.length > 0 ? band : same.length > 0 ? same : live;
+  const comps = [...pool]
+    .sort((a, b) => sizeDistance(a.tvl_usd, protocol.tvl_usd) - sizeDistance(b.tvl_usd, protocol.tvl_usd))
+    .slice(0, COMP_DISPLAY)
+    .map((p) => ({ name: p.name, tvl_usd: p.tvl_usd, ratio: Math.round(ratioOf(p, model) * 1e4) / 1e4 }));
+  return { multiple, bandMultiple, bandComps, categoryMultiple, categoryComps, marketMultiple: multiples.market, level, comps };
+}
+
 /** The four multipliers and the implied value one protocol gets under `model`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   multiples: { market: number; byCategory: Map<string, { multiple: number; comps: number }> },
+  snapshot: Snapshot,
   model: ModelConstants = MODEL,
 ): {
   implied: number;
-  categoryMultiple: number;
-  categoryComps: number;
+  blend: MultipleBlend;
   growthPct: number;
   growthMult: number;
   maturityMult: number;
@@ -294,12 +420,11 @@ export function impliedValue(
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
-  const entry = multiples.byCategory.get(protocol.category ?? 'Other');
-  const categoryMultiple = entry !== undefined ? entry.multiple : multiples.market;
-  const categoryComps = entry !== undefined ? entry.comps : 0;
+  const blend = blendMultiple(protocol, snapshot, multiples, model);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const growthMult =
+    1 + model.growth_weight * Math.sign(growthPct) * Math.pow(Math.abs(growthPct) / 100, model.growth_exponent);
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult =
     model.maturity_floor +
@@ -308,9 +433,9 @@ export function impliedValue(
   const breadthMult = 1 + model.breadth_per_chain * Math.min(chainCount - 1, model.breadth_max_chains);
   const implied = Math.max(
     1,
-    Math.round(protocol.tvl_usd * categoryMultiple * growthMult * maturityMult * breadthMult),
+    Math.round(protocol.tvl_usd * blend.multiple * growthMult * maturityMult * breadthMult),
   );
-  return { implied, categoryMultiple, categoryComps, growthPct, growthMult, maturityMult, breadthMult, age };
+  return { implied, blend, growthPct, growthMult, maturityMult, breadthMult, age };
 }
 
 /** The snapshot's protocol by slug. */
@@ -336,7 +461,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, multiples, model);
+    const v = impliedValue(p, snapshot.as_of, multiples, snapshot, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -356,9 +481,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      category_multiple: s.categoryMultiple,
-      category_comps: s.categoryComps,
-      market_multiple: multiples.market,
+      category_multiple: s.blend.multiple,
+      band_multiple: s.blend.bandMultiple,
+      band_comps: s.blend.bandComps,
+      category_comps: s.blend.categoryComps,
+      market_multiple: s.blend.marketMultiple,
+      comp_level: s.blend.level,
+      comps: s.blend.comps,
       growth_pct: s.growthPct,
       growth_multiplier: s.growthMult,
       maturity_multiplier: s.maturityMult,
@@ -542,7 +671,11 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     category_multiple: row.model.category_multiple,
+    band_multiple: row.model.band_multiple,
+    band_comps: row.model.band_comps,
     category_comps: row.model.category_comps,
+    comp_level: row.model.comp_level,
+    comps: row.model.comps,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     breadth_multiplier: row.model.breadth_multiplier,
@@ -557,15 +690,18 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot);
   const multiples = marketMultiples(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
-  const cats = new Map<string, { multiple: number; comps: number }>();
+  const cats = new Map<string, { multiple: number; comps: number; rowsBand: number }>();
   for (const row of board) {
     const key = row.category ?? 'Other';
-    if (!cats.has(key)) {
-      cats.set(key, {
-        multiple: row.model.category_multiple,
-        comps: row.model.category_comps,
-      });
-    }
+    const entry = cats.get(key) ?? {
+      multiple: row.model.category_comps > 0 && multiples.byCategory.get(key) !== undefined
+        ? multiples.byCategory.get(key)!.multiple
+        : multiples.market,
+      comps: row.model.category_comps,
+      rowsBand: 0,
+    };
+    if (row.model.band_comps > 0) entry.rowsBand += 1;
+    cats.set(key, entry);
   }
   const multiplesList: CategoryMultiple[] = [...cats.entries()]
     .map(([category, v]) => ({
@@ -573,6 +709,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       multiple: round4(v.multiple),
       comps: v.comps,
       from_market: v.comps === 0,
+      rows_band: v.rowsBand,
     }))
     .sort((a, b) => b.multiple - a.multiple);
   const radar: RadarData = {
@@ -653,6 +790,8 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
     for (const s of steps) if (s.trim().length < 20 || s.trim().length > 600) return `${r.slug} has a farm step of ${s.trim().length} characters`;
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (r.model.comps.length === 0) return `${r.slug} shows no comparables`;
+    if (!(r.model.category_multiple >= 0.05 && r.model.category_multiple <= 1.0)) return `${r.slug} has multiple ${r.model.category_multiple} outside [0.05, 1.0]`;
   }
   return null;
 }
